@@ -1631,7 +1631,16 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
 /** Reachable without the session token: liveness probes cannot carry one. */
   const UNGATED_PATHS = ["/healthz", "/readyz"];
 
+  // Browsers that ignore the Partitioned cookie attribute would otherwise let any site frame a
+  // gated preview and drive it.
+  const frameAncestors = requirePreviewToken
+    ? ["frame-ancestors", "'self'", ...metricsCorsOrigins].join(" ")
+    : null;
+
   const connectMiddleware = (async (req: SimReq, res: SimRes, next?: SimNext) => {
+    if (frameAncestors) {
+      res.setHeader("Content-Security-Policy", frameAncestors);
+    }
     const rawUrl: string = req.url ?? "";
     const qIndex = rawUrl.indexOf("?");
     const url = qIndex === -1 ? rawUrl : rawUrl.slice(0, qIndex);

@@ -52,7 +52,7 @@ export function connectToFetch(
   }) as IncomingMessage;
 
   let status = 200;
-  let responseHeaders = new Headers();
+  const responseHeaders = new Headers();
   let headersSent = false;
   let writableEnded = false;
   let writableFinished = false;
@@ -122,11 +122,27 @@ export function connectToFetch(
     get writableNeedDrain() { return writableNeedDrain; },
     get statusCode() { return status; },
     set statusCode(nextStatus: number) { status = nextStatus; },
+    setHeader(key: string, value: string | number | string[]) {
+      responseHeaders.delete(key);
+      if (Array.isArray(value)) {
+        for (const item of value) responseHeaders.append(key, item);
+      } else {
+        responseHeaders.set(key, String(value));
+      }
+      return fakeRes;
+    },
+    getHeader(key: string) {
+      return responseHeaders.get(key) ?? undefined;
+    },
+    removeHeader(key: string) {
+      responseHeaders.delete(key);
+    },
+    // Node merges these over anything already set, rather than replacing the set.
     writeHead(nextStatus: number, headers?: Record<string, string | number | string[]>) {
       status = nextStatus;
       if (headers) {
-        responseHeaders = new Headers();
         for (const [key, value] of Object.entries(headers)) {
+          responseHeaders.delete(key);
           if (Array.isArray(value)) {
             for (const item of value) responseHeaders.append(key, item);
           } else {

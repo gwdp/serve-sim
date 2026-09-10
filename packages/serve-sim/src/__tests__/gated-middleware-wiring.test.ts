@@ -134,3 +134,50 @@ describe("devtools proxy", () => {
     expect(upstream).not.toContain("token=");
   });
 });
+
+describe("framing policy", () => {
+  it("limits who may frame a gated preview, so a Partitioned-blind browser cannot", async () => {
+    const res = await fetch(`${BASE}/readyz`);
+
+    expect(res.headers.get("content-security-policy")).toBe("frame-ancestors 'self'");
+  });
+
+  it("names the origins allowed to embed the preview", async () => {
+    const port = PORT + 1;
+    const embedded = await servePreview({
+      port,
+      host: "127.0.0.1",
+      middleware: simMiddleware({
+        basePath: "/",
+        execToken: TOKEN,
+        requirePreviewToken: true,
+        metricsCorsOrigins: ["https://expo.dev"],
+      }),
+    });
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/readyz`);
+
+      expect(res.headers.get("content-security-policy")).toBe(
+        "frame-ancestors 'self' https://expo.dev",
+      );
+    } finally {
+      embedded.stop(true);
+    }
+  });
+
+  it("leaves an ungated preview framable, the way it always was", async () => {
+    const port = PORT + 2;
+    const ungated = await servePreview({
+      port,
+      host: "127.0.0.1",
+      middleware: simMiddleware({ basePath: "/", execToken: TOKEN }),
+    });
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/readyz`);
+
+      expect(res.headers.get("content-security-policy")).toBeNull();
+    } finally {
+      ungated.stop(true);
+    }
+  });
+});
