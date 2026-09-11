@@ -80,7 +80,7 @@ function ownerIsGone(ownerPid: number | null): boolean {
   }
 }
 
-export function readLaunchState(udid: string): LaunchState | null {
+export function readLaunchState(udid: string, retainOwnerPid?: number): LaunchState | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(readFileSync(stateFile(udid), "utf-8"));
@@ -94,7 +94,7 @@ export function readLaunchState(udid: string): LaunchState | null {
     launchArgs: Array.isArray(launchArgs)
       ? launchArgs.filter((arg): arg is string => typeof arg === "string")
       : [],
-    capabilities: recordedCapabilities(capabilities),
+    capabilities: recordedCapabilities(capabilities, retainOwnerPid),
     ...(Array.isArray(sessionPids) ? { sessionPids: sessionPids.filter(
       (pid) => Number.isInteger(pid) && pid > 0 && !ownerIsGone(pid),
     ) } : {}),
@@ -106,7 +106,7 @@ export function readLaunchState(udid: string): LaunchState | null {
  * formatCapabilityConfig and throw there instead of here, and one whose owner
  * died is a leftover nobody will disable.
  */
-function recordedCapabilities(value: unknown): Record<string, RecordedCapability> {
+function recordedCapabilities(value: unknown, retainOwnerPid?: number): Record<string, RecordedCapability> {
   if (typeof value !== "object" || value === null) return {};
   const kept: Record<string, RecordedCapability> = {};
   for (const [key, record] of Object.entries(value)) {
@@ -116,7 +116,7 @@ function recordedCapabilities(value: unknown): Record<string, RecordedCapability
       continue;
     }
     const owner = typeof ownerPid === "number" ? ownerPid : null;
-    if (ownerIsGone(owner)) continue;
+    if (owner !== retainOwnerPid && ownerIsGone(owner)) continue;
     kept[key] = {
       ...(record as RecordedCapability),
       bundleId: typeof bundleId === "string" ? bundleId : null,
@@ -129,7 +129,7 @@ function recordedCapabilities(value: unknown): Record<string, RecordedCapability
 function releaseLaunchStateUnlocked(
   udid: string, ownerPid: number, onRelease?: (capability: RecordedCapability) => void,
 ): boolean {
-  const previous = readLaunchState(udid);
+  const previous = readLaunchState(udid, ownerPid);
   if (!previous) return false;
   const kept = Object.fromEntries(
     Object.entries(previous.capabilities).filter(([, record]) => record.ownerPid !== ownerPid),
@@ -162,6 +162,40 @@ export function releaseSessionSync(
     if (!othersRemain) removeTrampolineSync(udid);
     armedHere.delete(udid);
   });
+}
+
+export async function releaseSession(
+  udid: string,
+  ownerPid: number,
+  onRelease: (capability: RecordedCapability) => void,
+): Promise<void> {
+  await waitForLaunchUpdates();
+  await withLaunchStateLock(udid, async () => {
+    const othersRemain = releaseLaunchStateUnlocked(udid, ownerPid, onRelease);
+    if (!othersRemain) removeTrampolineSync(udid);
+    armedHere.delete(udid);
+  });
+}
+
+export async function stopLaunchSession(
+  udid: string,
+  ownerPid: number,
+  onRelease: (capability: RecordedCapability) => void,
+): Promise<void> {
+  if (!Number.isInteger(ownerPid) || ownerPid <= 0 || ownerPid === process.pid) {
+    throw new Error(`Cannot stop session with invalid owner pid ${ownerPid}.`);
+  }
+  try { process.kill(ownerPid, "SIGTERM"); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+  }
+  const deadline = Date.now() + 60_000;
+  while (!ownerIsGone(ownerPid)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Session ${ownerPid} on ${udid} did not stop within 60 seconds. Its launch state was preserved; wait for shutdown to finish and retry.`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, LOCK_POLL_MS));
+  }
+  await releaseSession(udid, ownerPid, onRelease);
 }
 
 export function clearLaunchState(udid: string): void {
@@ -267,7 +301,19 @@ function lockHolderIsGone(path: string): boolean {
   }
 }
 
-async function withLaunchStateLock<T>(udid: string, fn: () => Promise<T>): Promise<T> {
+const pendingLaunchUpdates = new Set<Promise<unknown>>();
+
+export async function waitForLaunchUpdates(): Promise<void> {
+  while (pendingLaunchUpdates.size) await Promise.allSettled([...pendingLaunchUpdates]);
+}
+
+function withLaunchStateLock<T>(udid: string, fn: () => Promise<T>): Promise<T> {
+  const update = acquireLaunchStateLock(udid, fn);
+  pendingLaunchUpdates.add(update);
+  return update.finally(() => pendingLaunchUpdates.delete(update));
+}
+
+async function acquireLaunchStateLock<T>(udid: string, fn: () => Promise<T>): Promise<T> {
   if (!existsSync(stateDir())) mkdirSync(stateDir(), { recursive: true });
   const path = lockFile(udid);
   const deadline = Date.now() + LOCK_TIMEOUT_MS;
@@ -372,6 +418,7 @@ export function trampolinePath(): string {
 export async function armTrampoline(udid: string): Promise<void> {
   const dylib = trampolinePath();
   if (!existsSync(dylib)) return;
+  armedHere.add(udid);
   try {
     await withLaunchStateLock(udid, async () => {
       const previous = readLaunchState(udid) ?? { launchArgs: [], capabilities: {} };
@@ -544,7 +591,7 @@ export async function applyDefaultCapabilities(
       if (!capability) continue;
       resolved.push(capability);
     }
-    await enableCapabilitiesUnlocked(udid, bundleId, resolved);
+    await enableCapabilitiesUnlocked(udid, bundleId, resolved, { relaunch: false });
     const applied = resolved.map((capability) => capability.name);
 
     for (const name of overrides.enable ?? []) {

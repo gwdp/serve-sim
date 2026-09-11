@@ -13,10 +13,16 @@ import {
   readLaunchState,
   releaseLaunchState,
   releaseSessionSync,
+  releaseSession,
+  stopLaunchSession,
+  enableCapabilities,
+  applyDefaultCapabilities,
   renderCapabilityConfig,
 } from "../launch-manager";
+import { registerCapability, clearRegisteredCapabilities } from "../capabilities";
+import { launchAppAsync } from "../launch-app";
 import { stateDir } from "../state";
-import { useTempStateDir } from "./helpers";
+import { useTempStateDir, withShimsAsync } from "./helpers";
 
 const UDID = "LAUNCH-MANAGER-TEST-" + process.pid;
 
@@ -396,6 +402,99 @@ describe("session cleanup", () => {
       await exited;
     } finally {
       child.kill();
+    }
+  });
+});
+
+
+describe("graceful launch shutdown", () => {
+  test("awaits an active launch transaction before releasing its capabilities", async () => {
+    writeRawState(JSON.stringify({ launchArgs: [], capabilities: {}, sessionPids: [process.ppid] }));
+    await withShimsAsync({ xcrun: "#!/bin/sh\nsleep 0.15\nexit 0\n" }, async () => {
+      const released: string[] = [];
+      const update = enableCapabilities(UDID, null, [{
+        name: "camera", scope: "allApps", dylib: "/camera.dylib",
+      }], { relaunch: false });
+      const shutdown = releaseSession(UDID, process.pid, (record) => released.push(record.name));
+      await Promise.all([update, shutdown]);
+      expect(released).toEqual(["camera"]);
+      expect(listCapabilities(UDID)).toEqual([]);
+      expect(readLaunchState(UDID)?.sessionPids).toEqual([process.ppid]);
+    });
+  });
+
+  test("--kill waits for owner cleanup and preserves another live session", async () => {
+    const marker = join(stateDir(), "owner-cleaned");
+    const manager = join(import.meta.dir, "../launch-manager.ts");
+    const child = spawn(process.execPath, ["-e", `
+      const { releaseSessionSync } = await import(${JSON.stringify(manager)});
+      const fs = require("fs");
+      process.on("SIGTERM", () => setTimeout(() => {
+        releaseSessionSync(${JSON.stringify(UDID)}, process.pid, (record) => {
+          fs.writeFileSync(${JSON.stringify(marker)}, record.name);
+        });
+        process.exit(0);
+      }, 100));
+      setInterval(() => {}, 1000);
+      console.log("ready");
+    `], { stdio: ["ignore", "pipe", "pipe"] });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        child.once("error", reject);
+        child.stdout?.once("data", () => resolve());
+      });
+      writeRawState(JSON.stringify({
+        launchArgs: [], sessionPids: [child.pid, process.pid],
+        capabilities: { camera: { name: "camera", scope: "allApps", dylib: "/camera.dylib", ownerPid: child.pid } },
+      }));
+      const fallback: string[] = [];
+      await stopLaunchSession(UDID, child.pid!, (record) => fallback.push(record.name));
+      expect(readFileSync(marker, "utf-8")).toBe("camera");
+      expect(fallback).toEqual([]);
+      expect(readLaunchState(UDID)?.sessionPids).toEqual([process.pid]);
+    } finally {
+      child.kill("SIGKILL");
+    }
+  });
+
+  test("--kill releases a dead owner's resources without removing persistent ones", async () => {
+    const dead = 999_999;
+    writeRawState(JSON.stringify({
+      launchArgs: [], sessionPids: [process.pid],
+      capabilities: {
+        camera: { name: "camera", scope: "allApps", dylib: "/camera.dylib", ownerPid: dead },
+        probe: { name: "probe", scope: "allApps", dylib: "/probe.dylib", ownerPid: null },
+      },
+    }));
+    const released: string[] = [];
+    await stopLaunchSession(UDID, dead, (record) => released.push(record.name));
+    expect(released).toEqual(["camera"]);
+    expect(listCapabilities(UDID)).toEqual(["probe"]);
+    expect(readLaunchState(UDID)?.sessionPids).toEqual([process.pid]);
+  });
+});
+
+
+describe("startup capability loading", () => {
+  test("defaults do not restart a remembered app and explicit launch starts once", async () => {
+    const log = join(stateDir(), "simctl-startup-calls");
+    const quotedLog = "'" + log.replaceAll("'", "'\\''") + "'";
+    clearRegisteredCapabilities();
+    registerCapability({ name: "camera", defaultEnabled: false, scope: "allApps", async setEnabled() {
+      return { dylib: "/camera.dylib" };
+    } });
+    try {
+      await withShimsAsync({ xcrun: `#!/bin/sh\nprintf '%s\\n' "$*" >> ${quotedLog}\nexit 0\n` }, async () => {
+        writeRawState(JSON.stringify({ bundleId: "remembered.app", launchArgs: [], capabilities: {} }));
+        await applyDefaultCapabilities(UDID, null, { enable: ["camera"] });
+        const calls = () => readFileSync(log, "utf-8").split("\n");
+        expect(calls().filter((line) => /^simctl (launch|terminate) /.test(line))).toEqual([]);
+        await launchAppAsync(UDID, { bundleId: "explicit.app", launchArgs: [], capabilities: { enable: ["camera"] } });
+        expect(calls().filter((line) => line.startsWith("simctl launch "))).toEqual([`simctl launch ${UDID} explicit.app`]);
+        expect(calls().filter((line) => line.startsWith("simctl terminate "))).toEqual([`simctl terminate ${UDID} explicit.app`]);
+      });
+    } finally {
+      clearRegisteredCapabilities();
     }
   });
 });

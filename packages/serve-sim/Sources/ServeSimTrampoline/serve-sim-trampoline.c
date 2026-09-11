@@ -4,7 +4,7 @@
 // dylibs load on the main queue after the constructor returns.
 //
 // Config format, one capability per line, written by the launch manager:
-//   <container>\t<dylib>\t[KEY=VALUE;KEY=VALUE]
+//   <user|all>\t<dylib>\t[KEY=VALUE;KEY=VALUE]\t<delay-ms>
 //
 // The launch manager sets SERVE_SIM_CAPABILITIES_CONFIG alongside the insert,
 // per simulator, so the config can live with the rest of serve-sim's state
@@ -81,9 +81,6 @@ static int apply_env(char *pairs) {
 // Apple app ships inside the runtime, under RuntimeRoot.
 #define USER_APP_MARKER "/Containers/Bundle/Application/"
 
-// Splits one config line and answers whether it applies to this app. Returns 1
-// and points dylib/env into the line, or 0 to skip it. Separate from the load
-// loop so it can be tested without dlopen.
 static unsigned parse_delay_ms(const char *text) {
   if (text == NULL || *text == '\0') return 0;
   char *end = NULL;
