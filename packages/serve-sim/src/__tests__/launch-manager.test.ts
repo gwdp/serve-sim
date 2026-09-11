@@ -1,17 +1,18 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "fs";
+import { spawn } from "child_process";
 import { join } from "path";
 
 import {
   type RecordedCapability,
   MAX_CONFIG_BYTES,
-  childLaunchEnv,
   clearLaunchState,
   formatCapabilityConfig,
   isCapabilityEnabled,
   listCapabilities,
   readLaunchState,
   releaseLaunchState,
+  releaseSessionSync,
   renderCapabilityConfig,
 } from "../launch-manager";
 import { stateDir } from "../state";
@@ -169,22 +170,6 @@ describe("config size limit", () => {
   });
 });
 
-describe("childLaunchEnv", () => {
-  test("inserts the capability dylib and the trampoline into the launched app", () => {
-    const env = childLaunchEnv("/opt/injector.dylib", { SIMCAM_SHM_NAME: "/shm" });
-    const inserted = env.SIMCTL_CHILD_DYLD_INSERT_LIBRARIES!.split(":");
-
-    expect(inserted).toContain("/opt/injector.dylib");
-    expect(inserted.some((path) => path.endsWith("libServeSimTrampoline.dylib"))).toBe(true);
-  });
-
-  test("prefixes the capability environment so simctl passes it to the app", () => {
-    expect(childLaunchEnv("/opt/injector.dylib", { SIMCAM_SHM_NAME: "/shm" })).toMatchObject({
-      SIMCTL_CHILD_SIMCAM_SHM_NAME: "/shm",
-    });
-  });
-});
-
 describe("config field separators", () => {
   test("a value carrying a separator is refused", () => {
     for (const value of ["a\tb", "a\nb", "a;b"]) {
@@ -331,5 +316,86 @@ describe("releaseLaunchState", () => {
     );
 
     expect(listCapabilities(UDID)).toEqual([]);
+  });
+});
+
+
+describe("session cleanup", () => {
+  test("keeps another armed session even with no capabilities", () => {
+    writeRawState(JSON.stringify({
+      launchArgs: [], capabilities: {}, sessionPids: [process.pid, process.ppid],
+    }));
+    expect(releaseLaunchState(UDID, process.pid)).toBe(true);
+    expect(readLaunchState(UDID)?.sessionPids).toEqual([process.ppid]);
+    expect(listCapabilities(UDID)).toEqual([]);
+  });
+
+  test("releases only our host resources and preserves persistent capabilities", () => {
+    const capability = (name: string, ownerPid: number | null) => ({
+      name, ownerPid, bundleId: null, scope: "allApps", dylib: "/probe.dylib",
+    });
+    writeRawState(JSON.stringify({
+      launchArgs: [], sessionPids: [process.pid, process.ppid],
+      capabilities: {
+        ours: capability("ours", process.pid),
+        theirs: capability("theirs", process.ppid),
+        persistent: capability("persistent", null),
+      },
+    }));
+    const released: string[] = [];
+    releaseSessionSync(UDID, process.pid, (record) => released.push(record.name));
+    expect(released).toEqual(["ours"]);
+    expect(listCapabilities(UDID)).toEqual(["persistent", "theirs"]);
+  });
+
+  test("does not deadlock exit cleanup against its own active update", () => {
+    const lock = join(stateDir(), `launch-${UDID}.lock`);
+    writeRawState(JSON.stringify({ launchArgs: [], capabilities: {} }));
+    writeFileSync(lock, String(process.pid));
+    try {
+      expect(() => releaseLaunchState(UDID, process.pid)).toThrow("while this process is updating");
+      expect(readLaunchState(UDID)).not.toBeNull();
+    } finally {
+      unlinkSync(lock);
+    }
+  });
+
+  test("waits for a concurrent update before deciding what to release", async () => {
+    const lock = join(stateDir(), `launch-${UDID}.lock`);
+    const target = join(stateDir(), `launch-${UDID}.json`);
+    const ready = join(stateDir(), "cleanup-lock-ready");
+    writeRawState(JSON.stringify({ launchArgs: [], capabilities: {
+      sentinel: { name: "sentinel", scope: "allApps", dylib: "/probe.dylib", ownerPid: null },
+    } }));
+    const script = `
+      const fs = require("fs");
+      fs.writeFileSync(${JSON.stringify(lock)}, String(process.pid), { flag: "wx" });
+      fs.writeFileSync(${JSON.stringify(ready)}, "ready");
+      setTimeout(() => {
+        fs.writeFileSync(${JSON.stringify(target)}, JSON.stringify({
+          launchArgs: [], capabilities: { camera: {
+            name: "camera", scope: "allApps", dylib: "/camera.dylib", ownerPid: null,
+          } },
+        }));
+        fs.unlinkSync(${JSON.stringify(lock)});
+      }, 300);
+    `;
+    const child = spawn(process.execPath, ["-e", script], { stdio: "ignore" });
+    const exited = new Promise<void>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`writer exited ${code}`)));
+    });
+    const deadline = Date.now() + 3000;
+    while (!existsSync(ready) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    try {
+      expect(existsSync(ready)).toBe(true);
+      releaseSessionSync(UDID, process.pid, () => {});
+      expect(listCapabilities(UDID)).toEqual(["camera"]);
+      await exited;
+    } finally {
+      child.kill();
+    }
   });
 });

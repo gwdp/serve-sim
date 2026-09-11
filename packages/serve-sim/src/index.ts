@@ -33,9 +33,8 @@ import {
   clearLaunchState,
   devicesArmedHere,
   disarmStaleTrampoline,
-  releaseLaunchState,
+  releaseSessionSync,
   removeTrampoline,
-  removeTrampolineSync,
   setCapabilityEnabled,
 } from "./launch-manager";
 import { killOwnListeners } from "./ports";
@@ -387,10 +386,13 @@ async function ensureBooted(udid: string): Promise<void> {
  */
 function disarmDevicesArmedHere(): void {
   for (const udid of devicesArmedHere()) {
-    let othersRemain = false;
-    try { othersRemain = releaseLaunchState(udid, process.pid); } catch {}
-    if (othersRemain) continue;
-    try { removeTrampolineSync(udid); } catch {}
+    try {
+      releaseSessionSync(udid, process.pid, (capability) => {
+        if (capability.name === "camera") stopExistingHelper(udid);
+      });
+    } catch (error) {
+      console.error(`Could not clean up capabilities on ${udid}: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 }
 

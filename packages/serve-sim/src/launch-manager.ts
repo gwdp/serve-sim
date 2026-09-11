@@ -60,6 +60,7 @@ export interface RecordedCapability extends Capability {
 }
 
 interface LaunchState {
+  sessionPids?: number[];
   bundleId?: string;
   launchArgs: string[];
   capabilities: Record<string, RecordedCapability>;
@@ -87,13 +88,16 @@ export function readLaunchState(udid: string): LaunchState | null {
     return null;
   }
   if (typeof parsed !== "object" || parsed === null) return null;
-  const { bundleId, launchArgs, capabilities } = parsed as Partial<LaunchState>;
+  const { bundleId, launchArgs, capabilities, sessionPids } = parsed as Partial<LaunchState>;
   return {
     ...(typeof bundleId === "string" && bundleId ? { bundleId } : {}),
     launchArgs: Array.isArray(launchArgs)
       ? launchArgs.filter((arg): arg is string => typeof arg === "string")
       : [],
     capabilities: recordedCapabilities(capabilities),
+    ...(Array.isArray(sessionPids) ? { sessionPids: sessionPids.filter(
+      (pid) => Number.isInteger(pid) && pid > 0 && !ownerIsGone(pid),
+    ) } : {}),
   };
 }
 
@@ -122,24 +126,42 @@ function recordedCapabilities(value: unknown): Record<string, RecordedCapability
   return kept;
 }
 
-/**
- * Drops this process's capability records and reports whether any remain, so a
- * session that armed a device does not disarm it under another one still using it.
- */
-export function releaseLaunchState(udid: string, ownerPid: number): boolean {
+function releaseLaunchStateUnlocked(
+  udid: string, ownerPid: number, onRelease?: (capability: RecordedCapability) => void,
+): boolean {
   const previous = readLaunchState(udid);
   if (!previous) return false;
   const kept = Object.fromEntries(
     Object.entries(previous.capabilities).filter(([, record]) => record.ownerPid !== ownerPid),
   );
-  if (Object.keys(kept).length === 0) {
+  const sessionPids = previous.sessionPids?.filter((pid) => pid !== ownerPid);
+  for (const record of Object.values(previous.capabilities)) {
+    if (record.ownerPid === ownerPid) onRelease?.(record);
+  }
+  if (Object.keys(kept).length === 0 && !sessionPids?.length) {
     clearLaunchState(udid);
     return false;
   }
-  const state: LaunchState = { ...previous, capabilities: kept };
+  const state: LaunchState = { ...previous, capabilities: kept, ...(sessionPids ? { sessionPids } : {}) };
   writeLaunchState(udid, state);
   commitCapabilityConfig(udid, renderCapabilityConfig(state));
   return true;
+}
+
+export function releaseLaunchState(udid: string, ownerPid: number): boolean {
+  return withLaunchStateLockSync(udid, () => releaseLaunchStateUnlocked(udid, ownerPid));
+}
+
+export function releaseSessionSync(
+  udid: string,
+  ownerPid: number,
+  onRelease: (capability: RecordedCapability) => void,
+): void {
+  withLaunchStateLockSync(udid, () => {
+    const othersRemain = releaseLaunchStateUnlocked(udid, ownerPid, onRelease);
+    if (!othersRemain) removeTrampolineSync(udid);
+    armedHere.delete(udid);
+  });
 }
 
 export function clearLaunchState(udid: string): void {
@@ -277,31 +299,44 @@ async function withLaunchStateLock<T>(udid: string, fn: () => Promise<T>): Promi
   }
 }
 
+function withLaunchStateLockSync<T>(udid: string, fn: () => T): T {
+  mkdirSync(stateDir(), { recursive: true });
+  const path = lockFile(udid);
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  let fd: number;
+  for (;;) {
+    try {
+      fd = openSync(path, "wx");
+      writeFileSync(fd, String(process.pid));
+      break;
+    } catch {
+      let holder: string | undefined;
+      try { holder = readFileSync(path, "utf-8").trim(); } catch {}
+      if (holder === String(process.pid)) {
+        throw new Error(`Cannot release launch state for ${udid} while this process is updating it. Run cleanup again after the command finishes.`);
+      }
+      if (lockHolderIsGone(path)) {
+        try { unlinkSync(path); } catch {}
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`Could not release launch state for ${udid}: ${path} is still locked. Retry cleanup after the active command finishes.`);
+      }
+      Atomics.wait(sleeper, 0, 0, LOCK_POLL_MS);
+    }
+  }
+  try { return fn(); } finally {
+    closeSync(fd);
+    try { unlinkSync(path); } catch {}
+  }
+}
+
 async function simctl(args: string[], timeout = 30_000): Promise<string> {
   const { stdout } = await execFileAsync("xcrun", ["simctl", ...args], {
     encoding: "utf8",
     timeout,
   });
   return stdout.trim();
-}
-
-/**
- * `SIMCTL_CHILD_*` variables reach the app simctl launches. The insert has to
- * carry the capability dylib itself, so a swizzle is in place before the app's
- * own code runs, and the trampoline, because simctl's value replaces the
- * device-wide one for this process and would otherwise drop every other
- * capability.
- */
-export function childLaunchEnv(
-  dylib: string,
-  capabilityEnv: Record<string, string>,
-): Record<string, string> {
-  return {
-    SIMCTL_CHILD_DYLD_INSERT_LIBRARIES: [dylib, trampolinePath()].join(":"),
-    ...Object.fromEntries(
-      Object.entries(capabilityEnv).map(([key, value]) => [`SIMCTL_CHILD_${key}`, value]),
-    ),
-  };
 }
 
 const armedHere = new Set<string>();
@@ -338,7 +373,14 @@ export async function armTrampoline(udid: string): Promise<void> {
   const dylib = trampolinePath();
   if (!existsSync(dylib)) return;
   try {
-    await armInsert(udid, dylib);
+    await withLaunchStateLock(udid, async () => {
+      const previous = readLaunchState(udid) ?? { launchArgs: [], capabilities: {} };
+      await armInsert(udid, dylib);
+      writeLaunchState(udid, {
+        ...previous,
+        sessionPids: [...new Set([...(previous.sessionPids ?? []), process.pid])],
+      });
+    });
   } catch (error) {
     console.error(
       `Could not arm the capability trampoline on ${udid}, so capabilities will not load this ` +
@@ -414,11 +456,10 @@ export async function launchApp(
 ): Promise<void> {
   await withLaunchStateLock(udid, async () => {
     const previous = readLaunchState(udid);
-    const state: LaunchState = { bundleId, launchArgs, capabilities: previous?.capabilities ?? {} };
+    const state: LaunchState = { ...previous, bundleId, launchArgs, capabilities: previous?.capabilities ?? {} };
     const config = renderCapabilityConfig(state);
-    // The trampoline reads its config once, as the process starts, so both the
-    // insert and the config have to be in place before the launch they apply to.
-    if (Object.keys(state.capabilities).length > 0) await armTrampoline(udid);
+    // Publish the config before launching the app.
+    if (Object.keys(state.capabilities).length > 0) await armInsert(udid, trampolinePath());
     writeLaunchState(udid, state);
     commitCapabilityConfig(udid, config);
     if (restart) {
@@ -433,10 +474,6 @@ export async function openUrlInApp(udid: string, bundleId: string, openUrl: stri
   await simctl(["openurl", udid, openUrl]);
 }
 
-/**
- * Runs a definition's own state change and stamps the fields the manager owns,
- * so a definition cannot resolve to a different name or scope than it declared.
- */
 async function prepare(
   definition: CapabilityDefinition,
   context: CapabilityContext,
@@ -458,7 +495,6 @@ async function prepare(
   };
 }
 
-/** Turns a registered capability on or off, including its host-side work. */
 export async function setCapabilityEnabled(
   udid: string,
   name: string,
@@ -477,20 +513,22 @@ export async function setCapabilityEnabled(
   const definition = capabilityDefinition(name);
   const context: CapabilityContext = { udid, bundleId, options, enabled };
 
-  if (!enabled) {
-    await definition.setEnabled(context);
-    await disableCapability(udid, bundleId, name, { relaunch: false });
-    return;
-  }
+  await withLaunchStateLock(udid, async () => {
+    if (!enabled) {
+      await definition.setEnabled(context);
+      await disableCapabilityUnlocked(udid, bundleId, name, { relaunch: false });
+      return;
+    }
 
-  const capability = await prepare(definition, context);
-  if (!capability) {
-    throw new Error(
-      `Capability ${name} declined to start on ${udid}. It reported nothing to load, so there ` +
-        `is nothing to enable. Check the message above for why.`,
-    );
-  }
-  await enableCapabilities(udid, bundleId, [capability], { relaunch, ownerPid });
+    const capability = await prepare(definition, context);
+    if (!capability) {
+      throw new Error(
+        `Capability ${name} declined to start on ${udid}. It reported nothing to load, so there ` +
+          `is nothing to enable. Check the message above for why.`,
+      );
+    }
+    await enableCapabilitiesUnlocked(udid, bundleId, [capability], { relaunch, ownerPid });
+  });
 }
 
 export async function applyDefaultCapabilities(
@@ -498,23 +536,25 @@ export async function applyDefaultCapabilities(
   bundleId: string | null,
   overrides: CapabilityOverrides = {},
 ): Promise<string[]> {
-  const definitions = capabilitiesToApply(overrides);
-  const resolved: Capability[] = [];
-  for (const definition of definitions) {
-    const capability = await prepare(definition, { udid, bundleId, options: {}, enabled: true });
-    if (!capability) continue;
-    resolved.push(capability);
-  }
-  await enableCapabilities(udid, bundleId, resolved);
-  const applied = resolved.map((capability) => capability.name);
+  return withLaunchStateLock(udid, async () => {
+    const definitions = capabilitiesToApply(overrides);
+    const resolved: Capability[] = [];
+    for (const definition of definitions) {
+      const capability = await prepare(definition, { udid, bundleId, options: {}, enabled: true });
+      if (!capability) continue;
+      resolved.push(capability);
+    }
+    await enableCapabilitiesUnlocked(udid, bundleId, resolved);
+    const applied = resolved.map((capability) => capability.name);
 
-  for (const name of overrides.enable ?? []) {
-    if (applied.includes(name)) continue;
-    console.error(
-      `Capability ${name} was requested but did not apply on ${udid}.`,
-    );
-  }
-  return applied;
+    for (const name of overrides.enable ?? []) {
+      if (applied.includes(name)) continue;
+      console.error(
+        `Capability ${name} was requested but did not apply on ${udid}.`,
+      );
+    }
+    return applied;
+  });
 }
 
 export function isCapabilityEnabled(udid: string, name: string): boolean {
@@ -540,6 +580,15 @@ export async function enableCapabilities(
   udid: string,
   bundleId: string | null,
   capabilities: Capability[],
+  options: EnableOptions = {},
+): Promise<void> {
+  await withLaunchStateLock(udid, () => enableCapabilitiesUnlocked(udid, bundleId, capabilities, options));
+}
+
+async function enableCapabilitiesUnlocked(
+  udid: string,
+  bundleId: string | null,
+  capabilities: Capability[],
   { relaunch = true, ownerPid = process.pid }: EnableOptions = {},
 ): Promise<void> {
   if (capabilities.length === 0) return;
@@ -551,24 +600,22 @@ export async function enableCapabilities(
     );
   }
 
-  return await withLaunchStateLock(udid, async () => {
-    const previous = readLaunchState(udid);
-    const added = Object.fromEntries(
-      capabilities.map((capability) => [
-        capability.name,
-        { ...capability, bundleId, ownerPid },
-      ]),
-    );
-    const state: LaunchState = {
-      ...(previous ?? { launchArgs: [], capabilities: {} }),
-      capabilities: { ...(previous?.capabilities ?? {}), ...added },
-    };
-    const config = renderCapabilityConfig(state);
-    await armInsert(udid, dylib);
-    writeLaunchState(udid, state);
-    commitCapabilityConfig(udid, config);
-    if (relaunch) await relaunchTarget(udid, bundleId, state);
-  });
+  const previous = readLaunchState(udid);
+  const added = Object.fromEntries(
+    capabilities.map((capability) => [
+      capability.name,
+      { ...capability, bundleId, ownerPid },
+    ]),
+  );
+  const state: LaunchState = {
+    ...(previous ?? { launchArgs: [], capabilities: {} }),
+    capabilities: { ...(previous?.capabilities ?? {}), ...added },
+  };
+  const config = renderCapabilityConfig(state);
+  await armInsert(udid, dylib);
+  writeLaunchState(udid, state);
+  commitCapabilityConfig(udid, config);
+  if (relaunch) await relaunchTarget(udid, bundleId, state);
 }
 
 /** null when the check itself failed, which is not the same as "not running". */
@@ -612,21 +659,28 @@ export async function disableCapability(
   udid: string,
   bundleId: string | null,
   name: string,
+  options: EnableOptions = {},
+): Promise<void> {
+  await withLaunchStateLock(udid, () => disableCapabilityUnlocked(udid, bundleId, name, options));
+}
+
+async function disableCapabilityUnlocked(
+  udid: string,
+  bundleId: string | null,
+  name: string,
   { relaunch = true }: EnableOptions = {},
 ): Promise<void> {
-  await withLaunchStateLock(udid, async () => {
-    const previous = readLaunchState(udid);
-    if (!previous) return;
-    if (!(name in previous.capabilities)) return;
-    const rest = Object.fromEntries(
-      Object.entries(previous.capabilities).filter(([key]) => key !== name),
-    );
-    const state: LaunchState = { ...previous, capabilities: rest };
-    const config = renderCapabilityConfig(state);
-    writeLaunchState(udid, state);
-    commitCapabilityConfig(udid, config);
-    if (relaunch) await relaunchTarget(udid, bundleId, state);
-  });
+  const previous = readLaunchState(udid);
+  if (!previous) return;
+  if (!(name in previous.capabilities)) return;
+  const rest = Object.fromEntries(
+    Object.entries(previous.capabilities).filter(([key]) => key !== name),
+  );
+  const state: LaunchState = { ...previous, capabilities: rest };
+  const config = renderCapabilityConfig(state);
+  writeLaunchState(udid, state);
+  commitCapabilityConfig(udid, config);
+  if (relaunch) await relaunchTarget(udid, bundleId, state);
 }
 
 const URL_SCHEME_APPROVAL_DOMAIN = "com.apple.launchservices.schemeapproval";
