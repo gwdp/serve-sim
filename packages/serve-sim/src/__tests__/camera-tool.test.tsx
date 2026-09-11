@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
   CameraStatusPill,
-  CameraTestPatternHint,
   CameraMediaPreview,
   CameraInlineBanner,
   CAMERA_HEIC_ERROR,
@@ -211,18 +210,6 @@ describe("CameraStatusPill — UI state matrix", () => {
     const html = renderToStaticMarkup(<CameraStatusPill state="disconnected" />);
     expect(html).toContain("Disconnected");
     expect(html).not.toContain("Active");
-  });
-});
-
-describe("CameraTestPatternHint (placeholder state, no source)", () => {
-  test("renders a visible 'Test-pattern feed' label", () => {
-    const html = renderToStaticMarkup(<CameraTestPatternHint />);
-    expect(html).toContain("Test-pattern feed");
-  });
-
-  test("uses subdued typography without low-opacity icons (text-only label)", () => {
-    const html = renderToStaticMarkup(<CameraTestPatternHint />);
-    expect(html).not.toContain("<svg");
   });
 });
 

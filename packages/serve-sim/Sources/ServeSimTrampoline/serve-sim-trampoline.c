@@ -313,15 +313,8 @@ static void serve_sim_trampoline_init(void) {
     return;
   }
 
-  // Loading anything here, or from a thread racing this one, deadlocks: the
-  // app's launch holds the ObjC load lock and wants dyld's, while a concurrent
-  // dlopen holds dyld's and wants ObjC's. FrontBoard then kills the app for
-  // taking too long to launch. The main queue does not run until the app is
-  // past that, so it is the signal that loading is safe. A process that never
-  // runs its main queue loads nothing, which is the right answer for one that
-  // is not an app.
-  // On the main queue itself, not hopping off it: the block is queued before
-  // the app's own, so the capability is in place before the app can ask for it.
+  // Concurrent dlopen during construction can invert the dyld/ObjC load locks.
+  // Defer capability loads to the main queue after construction completes.
   dispatch_async(dispatch_get_main_queue(), ^{
     watch_config(load);
     load_capabilities(load);

@@ -142,17 +142,6 @@ export function CameraStatusPill({ state }: { state: CameraPillState }) {
   );
 }
 
-export function CameraTestPatternHint() {
-  return (
-    <p
-      className="m-0 text-center text-[10px] leading-[1.5] text-white/45"
-      data-camera-test-pattern-hint
-    >
-      Test-pattern feed
-    </p>
-  );
-}
-
 interface CameraMediaPreviewProps {
   mode: "placeholder" | "file" | "webcam" | "browser" | "uploading";
   fileName: string | null;
@@ -652,9 +641,7 @@ export function CameraTool({
         className="flex flex-col gap-2.5"
       >
           <p className="m-0 text-[10px] leading-[1.5] text-white/45">
-            Enable connects the selected camera feed to all apps. Disable disconnects
-            it without restarting apps. Choose media, Browser camera, or use the
-            test-pattern feed.
+            Choose an image, video, or camera, then enable it for all apps.
           </p>
 
           <input
@@ -706,8 +693,6 @@ export function CameraTool({
               </button>
             )}
           </div>
-
-          {isPlaceholder && !uploading && <CameraTestPatternHint />}
 
           <div className="flex flex-col gap-1.5" data-camera-source-menu>
           <div className="flex items-stretch gap-1.5">
