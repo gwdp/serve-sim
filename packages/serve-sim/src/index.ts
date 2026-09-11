@@ -1220,7 +1220,7 @@ function spawnCameraHelper(args: {
   return child.pid;
 }
 
-type CamSourceKind = "placeholder" | "webcam" | "image" | "video";
+type CamSourceKind = "placeholder" | "webcam" | "image" | "video" | "stream";
 
 interface ResolvedSource { kind: CamSourceKind; arg?: string }
 
@@ -1285,7 +1285,9 @@ function detectMediaKind(filePath: string): "image" | "video" | null {
 function resolveSourceArg(opts: {
   file?: string;
   webcam?: string | true;
+  stream?: boolean;
 }): ResolvedSource {
+  if (opts.stream) return { kind: "stream" };
   if (opts.file) {
     const abs = resolve(opts.file);
     const kind = detectMediaKind(abs);
@@ -1339,6 +1341,7 @@ async function camera(args: string[]) {
   let deviceArg: string | undefined;
   let filePath: string | undefined;
   let webcam: string | true | undefined;
+  let stream = false;
   let stopWebcam = false;
   let listWebcams = false;
   let forceBuild = false;
@@ -1360,6 +1363,7 @@ async function camera(args: string[]) {
       else { webcam = true; }
       continue;
     }
+    if (a === "--stream") { stream = true; continue; }
     if (a === "--list-webcams") { listWebcams = true; continue; }
     if (a === "--stop-webcam") { stopWebcam = true; continue; }
     if (a === "--build") { forceBuild = true; continue; }
@@ -1380,7 +1384,7 @@ async function camera(args: string[]) {
     if (a === "--no-mirror") { mirror = "off"; continue; }
     if (a === "--help" || a === "-h") {
       console.log(`Usage: serve-sim camera enable [-d udid] [source-options] [--build]
-       serve-sim camera switch <placeholder|webcam|file> [arg] [-d udid]
+       serve-sim camera switch <placeholder|webcam|file|stream> [arg] [-d udid]
        serve-sim camera mirror <auto|on|off> [-d udid]
        serve-sim camera --list-webcams
        serve-sim camera disable [-d udid]
@@ -1391,6 +1395,7 @@ Enable, disable, source changes, and mirroring never restart apps or change
 camera permissions. Disable disconnects the camera in running apps.
 
 Source options (pick one; default is placeholder):
+      --stream               Receive frames from the preview browser
   -f, --file <path>          Image or video file (kind auto-detected)
       --webcam [name]        Live host webcam (default: built-in front camera)
 
@@ -1475,7 +1480,7 @@ Examples:
     // `camera switch /path/to/clip.mov` — sniff the file and pick the kind.
     if (wanted && wanted !== "placeholder" && wanted !== "webcam"
         && wanted !== "image" && wanted !== "video"
-        && wanted !== "file") {
+        && wanted !== "file" && wanted !== "stream") {
       const candidate = resolve(wanted);
       if (existsSync(candidate)) { arg = candidate; wanted = "file"; }
     }
@@ -1492,8 +1497,8 @@ Examples:
       }
       wanted = detected;
     }
-    if (!wanted || (wanted !== "placeholder" && wanted !== "webcam" && wanted !== "image" && wanted !== "video")) {
-      console.error("Usage: serve-sim camera switch <placeholder|webcam|file> [arg] [-d udid]");
+    if (!wanted || (wanted !== "placeholder" && wanted !== "webcam" && wanted !== "image" && wanted !== "video" && wanted !== "stream")) {
+      console.error("Usage: serve-sim camera switch <placeholder|webcam|file|stream> [arg] [-d udid]");
       process.exit(1);
     }
     if ((wanted === "image" || wanted === "video") && arg) arg = resolve(arg);
@@ -1539,8 +1544,8 @@ Examples:
     process.exit(1);
   }
 
-  if (filePath && webcam) {
-    console.error("Pick one source: --file or --webcam, not both.");
+  if ([!!filePath, !!webcam, stream].filter(Boolean).length > 1) {
+    console.error("Choose one camera source: --file, --webcam, or --stream.");
     process.exit(1);
   }
 
@@ -1556,7 +1561,7 @@ Examples:
   // the dylib reads from a single shm wire format regardless of source.
   let source: ResolvedSource;
   try {
-    source = resolveSourceArg({ file: filePath, webcam });
+    source = resolveSourceArg({ file: filePath, webcam, stream });
   } catch (e: any) {
     console.error(e?.message ?? String(e));
     process.exit(1);

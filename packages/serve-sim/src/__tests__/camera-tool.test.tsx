@@ -36,9 +36,12 @@ describe("requestCameraStatus", () => {
   test("returns null for failed or malformed responses", async () => {
     const failedRequest = async () => new Response("no", { status: 503 });
     const malformedRequest = async () => Response.json(["not", "an", "object"]);
+    const errorBodyRequest = async () => Response.json({ error: "temporarily unavailable" });
 
     expect(await requestCameraStatus("/status", failedRequest)).toBeNull();
     expect(await requestCameraStatus("/status", malformedRequest)).toBeNull();
+    expect(await requestCameraStatus("/status", errorBodyRequest)).toBeNull();
+    expect(await requestCameraStatus("/status", async () => Response.json({ alive: false }))).toEqual({ alive: false });
   });
 });
 
@@ -245,6 +248,14 @@ describe("CameraMediaPreview — source states", () => {
     );
     expect(html).toContain("reel.mp4");
     expect(html).toContain("Video");
+  });
+
+  test("browser source identifies the viewer camera", () => {
+    const html = renderToStaticMarkup(
+      <CameraMediaPreview mode="browser" fileName={null} webcamName="Laptop camera" sourceKind="browser" />,
+    );
+    expect(html).toContain("Browser");
+    expect(html).toContain("Laptop camera");
   });
 
   test("webcam source shows the webcam name and Webcam badge", () => {
